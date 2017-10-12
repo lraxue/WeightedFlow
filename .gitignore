@@ -1,6 +1,10 @@
 log/ 
-log_20171008/ 
+log_20171008/
+log_20171011/ 
 log_bp/ 
 result/ 
 data/ 
-
+.idea/
+eval/ 
+result/
+data/ 

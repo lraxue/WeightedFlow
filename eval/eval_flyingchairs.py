@@ -263,10 +263,6 @@ def main():
     parser.add_argument('--dataset_dir', type=str, default='/home/fei/Data/fei/flow/FlyingChairs_release/data/',
                         help='dataset dir')
 
-    with open('../flyingchairs_test.txt') as f:
-        files = f.readlines()
-
-    flow_gt = []
     # for i in range(len(files)):
     #     line = files[i].strip().split()[2]   # flow file
     #     flow_gt.append(os.path.join(parser.parse_args().dataset_dir, line))
@@ -275,26 +271,31 @@ def main():
 
     # eval_flow = np.load(parser.parse_args().flow_file)
 
-    flow_est = load_flow_from_file(parser.parse_args().flowfile)
-    print(flow_est.shape[0])
+    # flow_est = load_flow_from_file(parser.parse_args().flowfile)
+    # print(flow_est.shape[0])
     with open('../flyingchairs_test.txt') as f:
         files = f.readlines()
-
-    aee_total = []
-    error_file = open('error.txt', 'w')
+    #
+    # aee_total = []
+    # error_file = open('error.txt', 'w')
+    flows_gt = np.zeros([len(files), 384, 512, 2])
     for i in range(len(files)):
         filename = files[i].strip().split()[2]
         flow_gt = read_flow(os.path.join(parser.parse_args().dataset_dir, filename))
+
+        flows_gt[i] = flow_gt
         # aee = aee_f(flow_gt, flow_est)
-        aee = epe(flow_gt, flow_est[i])
-        aee_total.append(aee)
-        error_file.write(filename + ' ' + '%.4f\n' % aee)
-        print('sample: %d, aee:%.4f' % (i, aee))
+        # aee = epe(flow_gt, flow_est[i])
+        # aee_total.append(aee)
+        # error_file.write(filename + ' ' + '%.4f\n' % aee)
+        # print('sample: %d, aee:%.4f' % (i, aee))
         # visualzie_flow(flow_est[i], save_flow=True, save_dir=parser.parse_args().save_dir, file=filename)
 
-    print('mean aee of all test samples: ', np.mean(aee_total))
-    error_file.write('mean_aee: %.4f\n' % np.mean(aee_total))
-    error_file.close()
+    # print('mean aee of all test samples: ', np.mean(aee_total))
+    # error_file.write('mean_aee: %.4f\n' % np.mean(aee_total))
+    # error_file.close()
+
+    np.save('flyingvhairs_test_flow.npy', flows_gt)
 
 
 if __name__ == '__main__':

@@ -16,6 +16,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse import diags
 from scipy.sparse.linalg import cg
 import cv2
+import tensorflow as tf
 from skimage.io import imread
 from skimage.transform import resize
 from skimage import data, io
@@ -38,8 +39,10 @@ MAX_VAL = 255.0
 def rgb2yuv(im):
     return np.tensordot(im, RGB_TO_YUV, ([2], [1])) + YUV_OFFSET
 
+
 def yuv2rgb(im):
     return np.tensordot(im.astype(float) - YUV_OFFSET, YUV_TO_RGB, ([2], [1]))
+
 
 def get_valid_idx(valid, candidates):
     """Find which values are present in a list and where they are located"""
@@ -50,6 +53,7 @@ def get_valid_idx(valid, candidates):
     valid_idx = np.flatnonzero(valid[locs] == candidates)
     locs = locs[valid_idx]
     return valid_idx, locs
+
 
 class BilateralGrid(object):
     def __init__(self, im, sigma_spatial=32, sigma_luma=8, sigma_chroma=8):
@@ -143,19 +147,21 @@ class BilateralSolver(object):
         A_smooth = (self.Dm - self.Dn.dot(self.grid.blur(self.Dn)))
         w_splat = self.grid.splat(w)
         A_data = diags(w_splat[:,0], 0)
-        A = self.params["lam"] * A_smooth + A_data
+        A = self.params["lam"] * A_smooth # + A_data
         xw = x * w
         b = self.grid.splat(xw)
         # Use simple Jacobi preconditioner
         A_diag = np.maximum(A.diagonal(), self.params["A_diag_min"])
         M = diags(1 / A_diag, 0)
         # Flat initialization
-        y0 = self.grid.splat(xw) / w_splat
+        print('w_splat:', w_splat)
+        y0 = self.grid.splat(xw)  / w_splat
         yhat = np.empty_like(y0)
         for d in range(x.shape[-1]):
             yhat[..., d], info = cg(A, b[..., d], x0=y0[..., d], M=M, maxiter=self.params["cg_maxiter"], tol=self.params["cg_tol"])
         xhat = self.grid.slice(yhat)
         return xhat
+
 
 def flow_solver_flo_var(reference, flow_flo, confidence, grid_params, bs_params):
     """Compute Bilateral Solver for direction channel in flow"""
@@ -186,6 +192,10 @@ def flow_solver_flo_var(reference, flow_flo, confidence, grid_params, bs_params)
     t_0 = target_0.reshape(-1, 1).astype(np.double)
     t_1 = target_1.reshape(-1, 1).astype(np.double)
     c = confidence.reshape(-1, 1).astype(np.double)
+
+    # t_0 = tf.reshape(target_0, (-1, 1))
+    # t_1 = tf.reshape(target_1, (-1, 1))
+    # c = tf.reshape(confidence, (-1, 1))
 
     #Apply a bilateral solver
     output_solver_0 = BilateralSolver(grid, bs_params).solve(t_0, c).reshape(im_shape)

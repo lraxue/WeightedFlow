@@ -17,33 +17,40 @@ import tools.bilateral_solver as bills
 
 from bilinear_sampler import *
 
-
 weightedflow_parameters = namedtuple('parameters',
-                        'encoder, '
-                        'height, width, '
-                        'batch_size, '
-                        'num_threads, '
-                        'num_epochs, '
-                        'wrap_mode, '
-                        'use_deconv, '
-                        'alpha_image_loss, '
-                        'flow_gradient_loss_weight, '
-                        'lr_loss_weight, '
-                        'full_summary')
+                                     'encoder, '
+                                     'height, width, '
+                                     'batch_size, '
+                                     'batch_norm, '
+                                     'record_bytes, '
+                                     'd_shape_flow, '
+                                     'd_shape_img, '
+                                     'num_threads, '
+                                     'num_epochs, '
+                                     'wrap_mode, '
+                                     'use_deconv, '
+                                     'alpha_image_loss, '
+                                     'flow_gradient_loss_weight, '
+                                     'lr_loss_weight, '
+                                     'full_summary, '
+                                     'scale')
 
 
 class WeightedFlow(object):
     """weighted optical flow"""
 
-    def __init__(self, params, mode, left, right, reuse_variables=None, model_index=0, optim=None):
+    def __init__(self, params, mode, left, right, flow_gt=None, reuse_variables=None, model_index=0, optim=None, batch_norm=True):
         self.params = params
         self.mode = mode
         self.left = left
         self.right = right
+        self.flow_gt = flow_gt
         self.model_collection = ['model_' + str(model_index)]
         self.reuse_variables = reuse_variables
+        self.batch_norm = batch_norm
 
         self.optim = optim
+        self.scales = [params.scale, params.scale / 2., params.scale / 4., params.scale / 8.]
 
         self.build_model()
         self.build_outputs()
@@ -119,13 +126,40 @@ class WeightedFlow(object):
         smoothness_y = [flow_gradients_y[i] * weights_y[i] for i in range(4)]
         return smoothness_x + smoothness_y
 
-    def conv(self, x, num_out_layers, kernel_size, stride, activation_fn=tf.nn.elu):
+    def batch_normalization(self, inputs, is_training=True, decay=0.999, epsilon=1e-3):
+        scale = tf.Variable(tf.ones([inputs.get_shape()[-1]]))
+        beta = tf.Variable(tf.zeros([inputs.get_shape()[-1]]))
+        pop_mean = tf.Variable(tf.zeros([inputs.get_shape()[-1]]), trainable=False)
+        pop_var = tf.Variable(tf.ones([inputs.get_shape()[-1]]), trainable=False)
+
+        if is_training:
+            batch_mean, batch_var = tf.nn.moments(inputs, [0])
+            train_mean = tf.assign(pop_mean, pop_mean * decay + batch_mean * (1 - decay))
+            train_var = tf.assign(pop_var, pop_var * decay + batch_var * (1 - decay))
+            with tf.control_dependencies([train_mean, train_var]):
+                return tf.nn.batch_normalization(inputs, batch_mean, batch_var, beta, scale, epsilon)
+        else:
+            return tf.nn.batch_normalization(inputs, pop_mean, pop_var, beta, scale, epsilon)
+
+    def lrelu(self, x, leak=0.1):
+        f1 = 0.5 * (1 + leak)
+        f2 = 0.5 * (1 - leak)
+        return f1 * x + f2 * abs(x)
+
+    def conv(self, x, num_out_layers, kernel_size, stride, activation_fn=None, batch_norm=True):
         p = np.floor((kernel_size - 1) / 2).astype(np.int32)
         p_x = tf.pad(x, [[0, 0], [p, p], [p, p], [0, 0]])
-        return slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn)
+
+        if self.batch_norm and batch_norm:
+            output = slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn,
+                               normalizer_fn=slim.batch_norm)
+        else:
+            output = slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn)
+
+        return self.lrelu(output)
 
     def conv_block(self, x, num_out_layers, kernel_size):
-        conv1 = self.conv(x,     num_out_layers, kernel_size, 1)
+        conv1 = self.conv(x, num_out_layers, kernel_size, 1)
         conv2 = self.conv(conv1, num_out_layers, kernel_size, 2)
         return conv2
 
@@ -137,14 +171,14 @@ class WeightedFlow(object):
     def resconv(self, x, num_layers, stride):
         do_proj = tf.shape(x)[3] != num_layers or stride == 2
         shortcut = []
-        conv1 = self.conv(x,         num_layers, 1, 1)
-        conv2 = self.conv(conv1,     num_layers, 3, stride)
+        conv1 = self.conv(x, num_layers, 1, 1)
+        conv2 = self.conv(conv1, num_layers, 3, stride)
         conv3 = self.conv(conv2, 4 * num_layers, 1, 1, None)
         if do_proj:
             shortcut = self.conv(x, 4 * num_layers, 1, stride, None)
         else:
             shortcut = x
-        return tf.nn.elu(conv3 + shortcut)
+        return self.lrelu(conv3 + shortcut)
 
     def resblock(self, x, num_layers, num_blocks):
         out = x
@@ -161,18 +195,27 @@ class WeightedFlow(object):
     def deconv(self, x, num_out_layers, kernel_size, scale):
         p_x = tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]])
         conv = slim.conv2d_transpose(p_x, num_out_layers, kernel_size, scale, 'SAME')
-        return conv[:,3:-1,3:-1,:]
+        conv = self.lrelu(conv)
+        return conv[:, 3:-1, 3:-1, :]
 
-    def get_flow(self, x):
-        return self.conv(x, 4, kernel_size=3, stride=1, activation_fn=tf.nn.sigmoid) - 0.5   # negative and positive
+    def get_flow(self, x, s, epsilon=1e-7):
+        flow = self.conv(x, 4, kernel_size=3, stride=1, activation_fn=None, batch_norm=False)  # negative and positive
+        return flow
 
     def epe(self, input_flow, target_flow):
-        return tf.norm(target_flow - input_flow, 2, 1)
+        square = tf.square(input_flow - target_flow)
+        x = square[:, :, :, 0]
+        y = square[:, :, :, 1]
+        epe = tf.sqrt(tf.add(x, y))
+        return epe
 
     def visualize_flow(self, flow, s):
-        nw = self.params.width / (2 ** s)
-        nh = self.params.height / (2 ** s)
-        return tf.sqrt(tf.multiply(flow[:,:,:,0] * nw, flow[:,:,:,0] * nw) + tf.multiply(flow[:,:,:,1] * nh, flow[:,:,:,1] * nh))
+        square = tf.square(flow)
+        x = square[:, :, :, 0]
+        y = square[:, :, :, 1]
+        sqr = tf.sqrt(tf.add(x, y))
+        return sqr
+        # return tf.sqrt(tf.multiply(flow[:, :, :, 0], flow[:, :, :, 0]) + tf.multiply(flow[:, :, :, 1], flow[:, :, :, 1]))
 
     def build_vgg(self):
         # set convenience functions
@@ -215,25 +258,25 @@ class WeightedFlow(object):
             upconv4 = upconv(iconv5, 128, 3, 2)  # H/8
             concat4 = tf.concat([upconv4, skip3], 3)
             iconv4 = conv(concat4, 128, 3, 1)
-            self.flow4 = self.get_flow(iconv4)
+            self.flow4 = self.get_flow(iconv4, 3)
             uflow4 = self.upsample_nn(self.flow4, 2)
 
             upconv3 = upconv(iconv4, 64, 3, 2)  # H/4
             concat3 = tf.concat([upconv3, skip2, uflow4], 3)
             iconv3 = conv(concat3, 64, 3, 1)
-            self.flow3 = self.get_flow(iconv3)
+            self.flow3 = self.get_flow(iconv3, 2)
             uflow3 = self.upsample_nn(self.flow3, 2)
 
             upconv2 = upconv(iconv3, 32, 3, 2)  # H/2
             concat2 = tf.concat([upconv2, skip1, uflow3], 3)
             iconv2 = conv(concat2, 32, 3, 1)
-            self.flow2 = self.get_flow(iconv2)
+            self.flow2 = self.get_flow(iconv2, 1)
             uflow2 = self.upsample_nn(self.flow2, 2)
 
             upconv1 = upconv(iconv2, 16, 3, 2)  # H
             concat1 = tf.concat([upconv1, uflow2], 3)
             iconv1 = conv(concat1, 16, 3, 1)
-            self.flow1 = self.get_flow(iconv1)
+            self.flow1 = self.get_flow(iconv1, 0)
 
     def build_resnet50(self):
         # set convenience functions
@@ -271,25 +314,25 @@ class WeightedFlow(object):
             upconv4 = upconv(iconv5, 128, 3, 2)  # H/8
             concat4 = tf.concat([upconv4, skip3], 3)
             iconv4 = conv(concat4, 128, 3, 1)
-            self.flow4 = self.get_flow(iconv4)
+            self.flow4 = self.get_flow(iconv4, 3)
             uflow4 = self.upsample_nn(self.flow4, 2)
 
             upconv3 = upconv(iconv4, 64, 3, 2)  # H/4
             concat3 = tf.concat([upconv3, skip2, uflow4], 3)
             iconv3 = conv(concat3, 64, 3, 1)
-            self.flow3 = self.get_flow(iconv3)
+            self.flow3 = self.get_flow(iconv3, 2)
             uflow3 = self.upsample_nn(self.flow3, 2)
 
             upconv2 = upconv(iconv3, 32, 3, 2)  # H/2
             concat2 = tf.concat([upconv2, skip1, uflow3], 3)
             iconv2 = conv(concat2, 32, 3, 1)
-            self.flow2 = self.get_flow(iconv2)
+            self.flow2 = self.get_flow(iconv2, 1)
             uflow2 = self.upsample_nn(self.flow2, 2)
 
             upconv1 = upconv(iconv2, 16, 3, 2)  # H
             concat1 = tf.concat([upconv1, uflow2], 3)
             iconv1 = conv(concat1, 16, 3, 1)
-            self.flow1 = self.get_flow(iconv1)
+            self.flow1 = self.get_flow(iconv1, 0)
 
     def build_model(self):
         with slim.arg_scope([slim.conv2d, slim.conv2d_transpose], activation_fn=tf.nn.elu):
@@ -298,6 +341,8 @@ class WeightedFlow(object):
                 self.right_pyramid = self.scale_pyramid(self.right, 4)
 
                 self.model_input = tf.concat([self.left, self.right], 3)
+
+                self.flow_gt_pyramid = self.scale_pyramid(self.flow_gt, 4)
 
                 # build model
                 if self.params.encoder == 'vgg':
@@ -311,10 +356,15 @@ class WeightedFlow(object):
         # Store Flow
         with tf.variable_scope('flows'):
             self.flow_est = [self.flow1, self.flow2, self.flow3, self.flow4]
-            self.flow_left_est = [d[:, :, :, 0:2]  for d in self.flow_est]
+            self.flow_left_est = [d[:, :, :, 0:2] for d in self.flow_est]
             self.flow_right_est = [d[:, :, :, 2:4] for d in self.flow_est]
 
             self.flow_images = [self.visualize_flow(self.flow_left_est[i], i) for i in range(4)]
+
+            self.flow_final = (self.flow_left_est[0] + self.flow_right_est[0]) / 2
+            self.flow_diff = self.epe(self.flow_final, self.flow_gt)
+            self.flow_error = tf.reduce_mean(self.flow_diff)
+            self.flow_gt_img = self.visualize_flow(self.flow_gt, 0)
 
         if self.mode == 'test':
             # self.flow_left_est[0][: ,:, :, 0] *= self.params.width
@@ -331,8 +381,10 @@ class WeightedFlow(object):
 
         # LR consistency
         with tf.variable_scope('left-right'):
-            self.right_to_left_flow = [self.generate_image_left(self.flow_right_est[i], self.flow_left_est[i]) for i in range(4)]
-            self.left_to_right_flow = [self.generate_image_right(self.flow_left_est[i], self.flow_right_est[i]) for i in range(4)]
+            self.right_to_left_flow = [self.generate_image_left(self.flow_right_est[i], self.flow_left_est[i]) for i in
+                                       range(4)]
+            self.left_to_right_flow = [self.generate_image_right(self.flow_left_est[i], self.flow_right_est[i]) for i in
+                                       range(4)]
 
         # Flow smoothness
         with tf.variable_scope('smoothness'):
@@ -355,18 +407,24 @@ class WeightedFlow(object):
             self.ssim_loss_right = [tf.reduce_mean(s) for s in self.ssim_right]
 
             # Weight Sum
-            self.image_loss_right = [self.params.alpha_image_loss * self.ssim_loss_right[i] + (1 - self.params.alpha_image_loss) * self.l1_reconstruction_loss_right[i] for i in range(4)]
-            self.image_loss_left = [self.params.alpha_image_loss * self.ssim_loss_left[i] + (1 - self.params.alpha_image_loss) * self.l1_reconstruction_loss_left[i] for i in range(4)]
+            self.image_loss_right = [
+                self.params.alpha_image_loss * self.ssim_loss_right[i] + (1 - self.params.alpha_image_loss) *
+                self.l1_reconstruction_loss_right[i] for i in range(4)]
+            self.image_loss_left = [
+                self.params.alpha_image_loss * self.ssim_loss_left[i] + (1 - self.params.alpha_image_loss) *
+                self.l1_reconstruction_loss_left[i] for i in range(4)]
             self.image_loss = tf.add_n(self.image_loss_left + self.image_loss_right)
 
             # Flow smoothness
-            self.flow_left_loss = [tf.reduce_mean(tf.abs(self.flow_left_smoothness[i])) / 2**i for i in range(4)]
-            self.flow_right_loss = [tf.reduce_mean(tf.abs(self.flow_right_smoothness[i])) / 2**i for i in range(4)]
+            self.flow_left_loss = [tf.reduce_mean(tf.abs(self.flow_left_smoothness[i])) / 2 ** i for i in range(4)]
+            self.flow_right_loss = [tf.reduce_mean(tf.abs(self.flow_right_smoothness[i])) / 2 ** i for i in range(4)]
             self.flow_gradient_loss = tf.add_n(self.flow_left_loss + self.flow_right_loss)
 
             # LR consistency
-            self.lr_left_loss = [tf.reduce_mean(tf.abs(self.right_to_left_flow[i] - self.flow_left_est[i])) for i in range(4)]
-            self.lr_right_loss = [tf.reduce_mean(tf.abs(self.left_to_right_flow[i] - self.flow_right_est[i])) for i in range(4)]
+            self.lr_left_loss = [tf.reduce_mean(tf.abs(self.right_to_left_flow[i] - self.flow_left_est[i])) for i in
+                                 range(4)]
+            self.lr_right_loss = [tf.reduce_mean(tf.abs(self.left_to_right_flow[i] - self.flow_right_est[i])) for i in
+                                  range(4)]
             self.lr_loss = tf.add_n(self.lr_left_loss + self.lr_right_loss)
 
             # Total loss
@@ -377,37 +435,61 @@ class WeightedFlow(object):
         max_output = 3
         with tf.device('/cpu:0'):
             for i in range(4):
-                tf.summary.scalar('ssim_loss_' + str(i), self.ssim_loss_left[i] + self.ssim_loss_right[i], collections=self.model_collection)
-                tf.summary.scalar('l1_loss_' + str(i), self.l1_reconstruction_loss_left[i] + self.l1_reconstruction_loss_right[i], collections=self.model_collection)
-                tf.summary.scalar('image_loss_' + str(i), self.image_loss_left[i] + self.image_loss_right[i], collections=self.model_collection)
-                tf.summary.scalar('flow_gradient_loss_' + str(i), self.flow_left_loss[i] + self.flow_right_loss[i], collections=self.model_collection)
-                tf.summary.scalar('lr_loss_' + str(i), self.lr_left_loss[i] + self.lr_right_loss[i], collections=self.model_collection)
-                tf.summary.image('flow_left_est_' + str(i), tf.expand_dims(tf.abs(self.flow_left_est[i][:,:,:,0]), -1), max_outputs=max_output, collections=self.model_collection)
-                tf.summary.image('flow_left_est_' + str(i), tf.expand_dims(tf.abs(self.flow_left_est[i][:,:,:,1]), -1), max_outputs=max_output, collections=self.model_collection)
-                tf.summary.image('flow_right_est_' + str(i), tf.expand_dims(tf.abs(self.flow_right_est[i][:,:,:,0]), -1), max_outputs=max_output, collections=self.model_collection)
-                tf.summary.image('flow_right_est_' + str(i), tf.expand_dims(tf.abs(self.flow_right_est[i][:,:,:,1]), -1), max_outputs=max_output, collections=self.model_collection)
-                tf.summary.image('flow_result_' + str(i), tf.expand_dims(self.flow_images[i], -1), max_outputs=max_output, collections=self.model_collection)
+                tf.summary.scalar('ssim_loss_' + str(i), self.ssim_loss_left[i] + self.ssim_loss_right[i],
+                                  collections=self.model_collection)
+                tf.summary.scalar('l1_loss_' + str(i),
+                                  self.l1_reconstruction_loss_left[i] + self.l1_reconstruction_loss_right[i],
+                                  collections=self.model_collection)
+                tf.summary.scalar('image_loss_' + str(i), self.image_loss_left[i] + self.image_loss_right[i],
+                                  collections=self.model_collection)
+                tf.summary.scalar('flow_gradient_loss_' + str(i), self.flow_left_loss[i] + self.flow_right_loss[i],
+                                  collections=self.model_collection)
+                tf.summary.scalar('lr_loss_' + str(i), self.lr_left_loss[i] + self.lr_right_loss[i],
+                                  collections=self.model_collection)
+                tf.summary.image('flow_left_est_' + str(i),
+                                 tf.expand_dims(tf.abs(self.flow_left_est[i][:, :, :, 0]), -1), max_outputs=max_output,
+                                 collections=self.model_collection)
+                tf.summary.image('flow_left_est_' + str(i),
+                                 tf.expand_dims(tf.abs(self.flow_left_est[i][:, :, :, 1]), -1), max_outputs=max_output,
+                                 collections=self.model_collection)
+                tf.summary.image('flow_right_est_' + str(i),
+                                 tf.expand_dims(tf.abs(self.flow_right_est[i][:, :, :, 0]), -1), max_outputs=max_output,
+                                 collections=self.model_collection)
+                tf.summary.image('flow_right_est_' + str(i),
+                                 tf.expand_dims(tf.abs(self.flow_right_est[i][:, :, :, 1]), -1), max_outputs=max_output,
+                                 collections=self.model_collection)
+                tf.summary.image('flow_result_' + str(i), tf.expand_dims(self.flow_images[i], -1),
+                                 max_outputs=max_output, collections=self.model_collection)
                 # tf.summary.image('_result_' + str(i), tf.expand_dims(self.flow_images[i], -1), max_outputs=max_output, collections=self.model_collection)
                 # tf.summary.image('flow_result_' + str(i), tf.expand_dims(self.flow_images[i], -1), max_outputs=max_output, collections=self.model_collection)
 
                 if self.params.full_summary:
-                    tf.summary.image('left_est_' + str(i), self.left_est[i], max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('right_est_' + str(i), self.right_est[i], max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('ssim_left_'  + str(i), self.ssim_left[i],  max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('ssim_right_' + str(i), self.ssim_right[i], max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('l1_left_'  + str(i), self.l1_left[i],  max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('l1_right_' + str(i), self.l1_right[i], max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('left_' + str(i), self.left_pyramid[i], max_outputs=max_output, collections=self.model_collection)
-                    tf.summary.image('right_' + str(i), self.right_pyramid[i], max_outputs=max_output, collections=self.model_collection)
-
-            # if self.optim is not None:
-            #     train_vars = [var for var in tf.trainable_variables()]
-            #     self.grads_and_vars = self.optim.compute_gradients(self.total_loss,
-            #                                                   var_list=train_vars)
-            #     for var in tf.trainable_variables():
-            #           tf.summary.histogram(var.op.name + "/values", var)
-            #     for grad, var in self.grads_and_vars:
-            #         tf.summary.histogram(var.op.name + "/gradients", grad)
+                    tf.summary.image('left_est_' + str(i), self.left_est[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('right_est_' + str(i), self.right_est[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('ssim_left_' + str(i), self.ssim_left[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('ssim_right_' + str(i), self.ssim_right[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('l1_left_' + str(i), self.l1_left[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('l1_right_' + str(i), self.l1_right[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('left_' + str(i), self.left_pyramid[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+                    tf.summary.image('right_' + str(i), self.right_pyramid[i], max_outputs=max_output,
+                                     collections=self.model_collection)
+            tf.summary.image('flow_error_with_gt', tf.expand_dims(self.flow_diff, -1), max_outputs=max_output, collections=self.model_collection)
+            tf.summary.image('flow_groundtruth', tf.expand_dims(self.flow_gt_img, -1), max_outputs=max_output, collections=self.model_collection)
+                    # if self.optim is not None:
+                    #     train_vars = [var for var in tf.trainable_variables()]
+                    #     self.grads_and_vars = self.optim.compute_gradients(self.total_loss,
+                    #                                                   var_list=train_vars)
+                    #     for var in tf.trainable_variables():
+                    #           tf.summary.histogram(var.op.name + "/values", var)
+                    #     for grad, var in self.grads_and_vars:
+                    #         tf.summary.histogram(var.op.name + "/gradients", grad)
 
     def build_test(self):
         return self.left_est[0]
