@@ -44,6 +44,16 @@ flags.DEFINE_integer('flow_net_shape', [384, 512, 2], 'Image shape: width, heigh
 flags.DEFINE_integer('record_bytes', 1572876, 'Flow record bytes reader')
 
 
+def aee_tf(gt, calc_flows):
+    "average end point error"
+    square = tf.square(gt - calc_flows)
+    x = square[:, :, 0]
+    y = square[:, :, 1]
+    sqr = tf.sqrt(tf.add(x, y))
+    aee = tf.reduce_mean(sqr)
+    return aee
+
+
 RGB_TO_YUV = np.array([
     [ 0.299,     0.587,     0.114],
     [-0.168736, -0.331264,  0.5],
@@ -111,11 +121,44 @@ def test_rgb2yuv():
     print(yuv)
 
 
+def test_aee():
+    I0 = tf.random_uniform([2, 3, 4, 2], 0, 1, tf.float32)
+    I1 = I0
+    I2 = tf.ones([2, 3, 4, 2], tf.float32)
+    I3 = tf.zeros([2, 3, 4, 2], tf.float32)
+
+    aee01 = aee_tf(I0, I1)
+    aee02 = aee_tf(I0, I2)
+    aee23 = aee_tf(I2, I3)
+
+    sess = tf.Session()
+    print(sess.run(aee01))
+    print(sess.run(aee02))
+    print(sess.run(aee23))
+
+
 
 def main():
     # test_flow_reader()
     # test_transform()
-    test_rgb2yuv()
+    # test_rgb2yuv()
+
+    # test_aee()
+
+    I = tf.ones([2, 1, 2])
+
+    I_0 = tf.expand_dims(I[:, :, 0], -1)
+    I_1 = tf.expand_dims(I[:, :, 1], -1)
+
+    I2 = tf.concat([-I_0, I_1], -1)
+    I3 = tf.concat([I_0, -I_1], -1)
+
+    sess = tf.Session()
+    print(sess.run(I))
+    print(sess.run(I2))
+    print(sess.run(I3))
+    print(I.shape)
+    print(I2.shape)
 
 
 if __name__ == '__main__':

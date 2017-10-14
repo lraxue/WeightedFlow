@@ -177,12 +177,28 @@ class FlowDataloader(object):
         flows = tf.slice(record_bytes, [3], [np.prod(self.params.d_shape_flow)])
         flow_o = tf.reshape(flows, self.params.d_shape_flow)
 
+        self.negative_ones = -tf.ones([self.params.height, self.params.width, 1])
+
         if mode == 'train':
             # randomly flip images
-            do_flip = tf.random_uniform([], 0, 1)
-            left_image = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(right_image_o), lambda: left_image_o)
-            right_image = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(left_image_o), lambda: right_image_o)
-            flow = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(flow_o), lambda: flow_o)
+            do_h_flip = tf.random_uniform([], 0, 1)
+            left_image = tf.cond(do_h_flip > 0.5, lambda: tf.image.flip_left_right(left_image_o), lambda: left_image_o)
+            right_image = tf.cond(do_h_flip > 0.5, lambda: tf.image.flip_left_right(right_image_o), lambda: right_image_o)
+            flow = tf.cond(do_h_flip > 0.5, lambda: tf.image.flip_left_right(flow_o), lambda: flow_o)
+            flow = tf.cond(do_h_flip > 0.5, lambda: self.opposite(flow, 1), lambda: flow)
+
+            do_v_flip = tf.random_uniform([], 0, 1)
+            left_image = tf.cond(do_v_flip > 0.5, lambda: tf.image.flip_up_down(left_image_o), lambda: left_image_o)
+            right_image = tf.cond(do_v_flip > 0.5, lambda: tf.image.flip_up_down(right_image_o), lambda: right_image_o)
+            flow = tf.cond(do_v_flip > 0.5, lambda: tf.image.flip_up_down(flow_o), lambda: flow_o)
+            flow = tf.cond(do_v_flip > 0.5, lambda: self.opposite(flow, 2), lambda: flow)
+
+            do_ex_left_right = tf.random_uniform([], 0, 1)
+            left_image = tf.cond(do_ex_left_right > 0.5, lambda: right_image_o, lambda: left_image_o)
+            right_image = tf.cond(do_ex_left_right > 0.5, lambda: right_image_o, lambda: right_image_o)
+            flow = tf.cond(do_ex_left_right > 0.5, lambda: flow_o, lambda: flow_o)
+            flow = tf.cond(do_ex_left_right > 0.5, lambda: self.opposite(flow, 0), lambda: flow)
+
 
             # randomly augment images
             do_augment = tf.random_uniform([], 0, 1)
@@ -209,6 +225,21 @@ class FlowDataloader(object):
 
             self.right_image_batch = tf.stack([right_image_o, tf.image.flip_left_right(right_image_o)], 0)
             self.right_image_batch.set_shape([2, None, None, 3])
+
+    def opposite(self, x, tag=0):
+        if tag == 0:
+            return -x
+        elif tag == 1:
+            x_0 = tf.expand_dims(x[:, :, 0], -1)
+            x_1 = tf.expand_dims(x[:, :, 1], -1)
+            out = tf.concat([-x_0, x_1], -1)
+            return out
+        elif tag == 2:
+            x_0 = tf.expand_dims(x[:, :, 0], -1)
+            x_1 = tf.expand_dims(x[:, :, 1], -1)
+            out = tf.concat([x_0, -x_1], -1)
+            return out
+        return x
 
     def augment_image_pair(self, left_image, right_image):
         # randomly shift gamma

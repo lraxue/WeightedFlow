@@ -11,6 +11,7 @@ import numpy as np
 from skimage.io import imread, imsave
 import cv2
 import os
+import math
 import tensorflow.contrib.slim as slim
 import tools.visualize as viz
 import tools.bilateral_solver as bills
@@ -146,15 +147,23 @@ class WeightedFlow(object):
         f2 = 0.5 * (1 - leak)
         return f1 * x + f2 * abs(x)
 
+    def msra_initializer(self, kl, dl):
+        """
+        kl for kernel size, dl for filter number
+        """
+        stddev = math.sqrt(2. / (kl ** 2 * dl))
+        return tf.truncated_normal_initializer(stddev=stddev)
+
     def conv(self, x, num_out_layers, kernel_size, stride, activation_fn=None, batch_norm=True):
         p = np.floor((kernel_size - 1) / 2).astype(np.int32)
         p_x = tf.pad(x, [[0, 0], [p, p], [p, p], [0, 0]])
 
         if self.batch_norm and batch_norm:
             output = slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn,
-                               normalizer_fn=slim.batch_norm)
+                               normalizer_fn=slim.batch_norm, weights_initializer=self.msra_initializer(kernel_size, num_out_layers))
         else:
-            output = slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn)
+            output = slim.conv2d(p_x, num_out_layers, kernel_size, stride, 'VALID', activation_fn=activation_fn,
+                                 weights_initializer=self.msra_initializer(kernel_size, num_out_layers))
 
         return self.lrelu(output)
 
@@ -342,7 +351,8 @@ class WeightedFlow(object):
 
                 self.model_input = tf.concat([self.left, self.right], 3)
 
-                self.flow_gt_pyramid = self.scale_pyramid(self.flow_gt, 4)
+                if self.mode == 'train':
+                    self.flow_gt_pyramid = self.scale_pyramid(self.flow_gt, 4)
 
                 # build model
                 if self.params.encoder == 'vgg':
@@ -361,18 +371,18 @@ class WeightedFlow(object):
 
             self.flow_images = [self.visualize_flow(self.flow_left_est[i], i) for i in range(4)]
 
+            if self.mode == 'test':
+                # self.flow_left_est[0][: ,:, :, 0] *= self.params.width
+                # self.flow_left_est[0][: ,:, :, 1] *= self.params.height
+
+                # self.flow_left_est[0] = tf.image.resize_bicubic(self.flow_left_est[0], [384, 512])
+                # self.flow_right_est[0] = tf.image.resize_bicubic(self.flow_left_est[0], [384, 512])
+                return
+
             self.flow_final = (self.flow_left_est[0] + self.flow_right_est[0]) / 2
             self.flow_diff = self.epe(self.flow_final, self.flow_gt)
             self.flow_error = tf.reduce_mean(self.flow_diff)
             self.flow_gt_img = self.visualize_flow(self.flow_gt, 0)
-
-        if self.mode == 'test':
-            # self.flow_left_est[0][: ,:, :, 0] *= self.params.width
-            # self.flow_left_est[0][: ,:, :, 1] *= self.params.height
-
-            # self.flow_left_est[0] = tf.image.resize_bicubic(self.flow_left_est[0], [384, 512])
-            # self.flow_right_est[0] = tf.image.resize_bicubic(self.flow_left_est[0], [384, 512])
-            return
 
         # Generate images
         with tf.variable_scope('images'):
@@ -460,6 +470,9 @@ class WeightedFlow(object):
                                  collections=self.model_collection)
                 tf.summary.image('flow_result_' + str(i), tf.expand_dims(self.flow_images[i], -1),
                                  max_outputs=max_output, collections=self.model_collection)
+
+                tf.summary.histogram('flow_u_' + str(i), self.flow_left_est[i][:, :, :, 0], collections=self.model_collection)
+                tf.summary.histogram('flow_v_' + str(i), self.flow_left_est[i][:, :, :, 1], collections=self.model_collection)
                 # tf.summary.image('_result_' + str(i), tf.expand_dims(self.flow_images[i], -1), max_outputs=max_output, collections=self.model_collection)
                 # tf.summary.image('flow_result_' + str(i), tf.expand_dims(self.flow_images[i], -1), max_outputs=max_output, collections=self.model_collection)
 
@@ -482,6 +495,7 @@ class WeightedFlow(object):
                                      collections=self.model_collection)
             tf.summary.image('flow_error_with_gt', tf.expand_dims(self.flow_diff, -1), max_outputs=max_output, collections=self.model_collection)
             tf.summary.image('flow_groundtruth', tf.expand_dims(self.flow_gt_img, -1), max_outputs=max_output, collections=self.model_collection)
+            tf.summary.histogram('flow_diff', self.flow_diff, collections=self.model_collection)
                     # if self.optim is not None:
                     #     train_vars = [var for var in tf.trainable_variables()]
                     #     self.grads_and_vars = self.optim.compute_gradients(self.total_loss,

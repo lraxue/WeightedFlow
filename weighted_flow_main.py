@@ -34,9 +34,9 @@ parser.add_argument('--d_shape_flow', type=int, help='flow record bytes reader',
 parser.add_argument('--d_shape_image', type=int, help='flow record bytes reader', default=[384, 512, 3])
 
 parser.add_argument('--batch_size', type=int, help='batch size', default=8)
-parser.add_argument('--batch_norm', type=bool, help='batch normalizatio', default=True)
-parser.add_argument('--num_epochs', type=int, help='number of epochs', default=80)
-parser.add_argument('--learning_rate', type=float, help='initial learning rate', default=1e-3)
+parser.add_argument('--batch_norm', type=bool, help='batch normalizatio', default=False)
+parser.add_argument('--num_epochs', type=int, help='number of epochs', default=60)
+parser.add_argument('--learning_rate', type=float, help='initial learning rate', default=5e-4)
 parser.add_argument('--lr_loss_weight', type=float, help='left-right consistency weight', default=1.0)
 parser.add_argument('--alpha_image_loss', type=float, help='weight between SSIM and L1 in the image loss', default=0.85)
 parser.add_argument('--scale', type=float, help='scale of flow', default=500.)
@@ -257,7 +257,7 @@ def train(params):
                 print(print_string.format(step, examples_per_sec, loss_value, error_value, time_sofar, training_time_left))
                 summary_str = sess.run(summary_op)
                 summary_writer.add_summary(summary_str, global_step=step)
-            if step and step % 10000 == 0:
+            if step and step % 5000 == 0:
                 train_saver.save(sess, args.log_directory + '/' + args.model_name + '/model', global_step=step)
 
         train_saver.save(sess, args.log_directory + '/' + args.model_name + '/model', global_step=num_total_steps)
@@ -296,10 +296,16 @@ def test(params):
     print('now testing {} files'.format(num_test_samples))
     flows = np.zeros((num_test_samples * 2, 384, 512, 2), dtype=np.float32)
     flows_pp = np.zeros((num_test_samples, 384, 512, 2), dtype=np.float32)
-    for step in range(num_test_samples):
+    for step in range(num_test_samples//100):
         flow = sess.run(model.flow_left_est[0])
         flows[step * 2 + 0] = flow[0].squeeze()
         flows[step * 2 + 1] = flow[1].squeeze()
+
+        print('test example: ', step)
+        print(np.max(flows[step * 2 + 0]))
+        print(np.min(flows[step * 2 + 0]))
+        print(np.mean(flows[step * 2 + 0]))
+        print('\n')
         # flows_pp[step] = post_process_flow(flow.squeeze())
 
     print('done.')
@@ -309,7 +315,7 @@ def test(params):
         output_directory = os.path.dirname(args.checkpoint_path)
     else:
         output_directory = args.output_directory
-    np.save(output_directory + '/20171011_210000_bi_flows.npy', flows)
+    np.save(output_directory + '/20171012_40000_bi_flows.npy', flows)
     # np.save(output_directory + '/disparities_pp.npy', disparities_pp)
 
     print('done.')
